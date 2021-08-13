@@ -17,65 +17,84 @@ struct State {
     dinos: Arc<RwLock<HashMap<String, Dino>>>,
 }
 
-async fn dinos_create(mut req: Request<State>) -> tide::Result {
-    let dino: Dino = req.body_json().await?;
-    let mut dinos = req.state().dinos.write().await;
-    dinos.insert(String::from(&dino.name), dino.clone());
-    let mut res = Response::new(201);
-    res.set_body(Body::from_json(&dino)?);
-
-    Ok(res)
+struct RestEntity {
+    base_path: String,
 }
 
-async fn dinos_list(req: Request<State>) -> tide::Result {
-    let dinos = req.state().dinos.read().await;
-    let dinos_vec: Vec<Dino> = dinos.values().cloned().collect();
-    let mut res = Response::new(200);
-    res.set_body(Body::from_json(&dinos_vec)?);
-    Ok(res)
+impl RestEntity {
+    async fn create(mut req: Request<State>) -> tide::Result {
+        let dino: Dino = req.body_json().await?;
+        let mut dinos = req.state().dinos.write().await;
+        dinos.insert(String::from(&dino.name), dino.clone());
+        let mut res = Response::new(201);
+        res.set_body(Body::from_json(&dino)?);
+
+        Ok(res)
+    }
+
+    async fn list(req: Request<State>) -> tide::Result {
+        let dinos = req.state().dinos.read().await;
+        let dinos_vec: Vec<Dino> = dinos.values().cloned().collect();
+        let mut res = Response::new(200);
+        res.set_body(Body::from_json(&dinos_vec)?);
+        Ok(res)
+    }
+
+    async fn get(req: Request<State>) -> tide::Result {
+        let mut dinos = req.state().dinos.write().await;
+        let key = req.param("id")?;
+        let res = match dinos.entry(key.to_string()) {
+            Entry::Vacant(_) => Response::new(404),
+            Entry::Occupied(entry) => {
+                let mut res = Response::new(200);
+                res.set_body(Body::from_json(&entry.get())?);
+                res
+            },
+        };
+
+        Ok(res)
+    }
+
+    async fn update(mut req: Request<State>) -> tide::Result {
+        let dino_update: Dino = req.body_json().await?;
+        let mut dinos = req.state().dinos.write().await;
+        let key = req.param("id")?;
+        let res = match dinos.entry(key.to_string()) {
+            Entry::Vacant(_) => Response::new(404),
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() = dino_update;
+                let mut res = Response::new(200);
+                res.set_body(Body::from_json(&entry.get())?);
+                res
+            },
+        };
+
+        Ok(res)
+    }
+
+    async fn delete(req: Request<State>) -> tide::Result {
+        let mut dinos = req.state().dinos.write().await;
+        let key = req.param("id")?;
+        let deleted = dinos.remove(&key.to_string());
+        let res = match deleted {
+            None => Response::new(404),
+            Some(_) => Response::new(204),
+        };
+        Ok(res)
+    }
 }
 
-async fn dinos_get(req: Request<State>) -> tide::Result {
-    let mut dinos = req.state().dinos.write().await;
-    let key = req.param("name")?;
-    let res = match dinos.entry(key.to_string()) {
-        Entry::Vacant(_) => Response::new(404),
-        Entry::Occupied(entry) => {
-            let mut res = Response::new(200);
-            res.set_body(Body::from_json(&entry.get())?);
-            res
-        },
-    };
 
-    Ok(res)
-}
+fn register_rest_entity(app: &mut Server<State>, entity: RestEntity) {
+    app.at(&entity.base_path)
+        .get(RestEntity::list)
+        .post(RestEntity::create);
 
-async fn dinos_update(mut req: Request<State>) -> tide::Result {
-    let dino_update: Dino = req.body_json().await?;
-    let mut dinos = req.state().dinos.write().await;
-    let key = req.param("name")?;
-    let res = match dinos.entry(key.to_string()) {
-        Entry::Vacant(_) => Response::new(404),
-        Entry::Occupied(mut entry) => {
-            *entry.get_mut() = dino_update;
-            let mut res = Response::new(200);
-            res.set_body(Body::from_json(&entry.get())?);
-            res
-        },
-    };
-
-    Ok(res)
-}
-
-async fn dinos_delete(req: Request<State>) -> tide::Result {
-    let mut dinos = req.state().dinos.write().await;
-    let key = req.param("name")?;
-    let deleted = dinos.remove(&key.to_string());
-    let res = match deleted {
-        None => Response::new(404),
-        Some(_) => Response::new(204),
-    };
-    Ok(res)
+    println!("{}/:id", &entity.base_path);
+    app.at(&format!("{}/:id", &entity.base_path))
+        .get(RestEntity::get)
+        .put(RestEntity::update)
+        .delete(RestEntity::delete);
 }
 
 async fn server(dinos_store: Arc<RwLock<HashMap<String, Dino>>>) -> Server<State> {
@@ -83,17 +102,14 @@ async fn server(dinos_store: Arc<RwLock<HashMap<String, Dino>>>) -> Server<State
         dinos: dinos_store,
     };
 
+    let dinos_endpoint = RestEntity {
+        base_path: String::from("/dinos"),
+    };
+
     let mut app = tide::with_state(state);
-    app.at("/").get(|_| async move { Ok("Ok")});
+    app.at("/").get(|_| async { Ok("Ok") });
 
-    app.at("/dinos")
-        .get(dinos_list)
-        .post(dinos_create);
-
-    app.at("/dinos/:name")
-        .get(dinos_get)
-        .put(dinos_update)
-        .delete(dinos_delete);
+    register_rest_entity(&mut app, dinos_endpoint);
 
     app
 }
