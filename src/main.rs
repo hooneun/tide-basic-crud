@@ -1,20 +1,25 @@
-use tide::{Request, Response, Body, Server};
-use tide::prelude::*;
-use std::collections::hash_map::{Entry, HashMap};
-use async_std::sync::RwLock;
-use std::sync::Arc;
-
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct Dino {
-    name: String,
-    weight: u16,
-    diet: String,
-}
+use sqlx::{
+    postgres::{PgPool},
+    Pool,
+};
+use tide::{Body, Request, Response, Server};
+// use sqlx::{query, query_as};
+use dotenv;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 struct State {
-    dinos: Arc<RwLock<HashMap<String, Dino>>>,
+    db_pool: PgPool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, sqlx::FromRow)]
+struct Dino {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Uuid>,
+    name: String,
+    weight: i32,
+    diet: String,
 }
 
 struct RestEntity {
@@ -24,66 +29,116 @@ struct RestEntity {
 impl RestEntity {
     async fn create(mut req: Request<State>) -> tide::Result {
         let dino: Dino = req.body_json().await?;
-        let mut dinos = req.state().dinos.write().await;
-        dinos.insert(String::from(&dino.name), dino.clone());
+        let db_pool = req.state().db_pool.clone();
+        let row = sqlx::query_as::<_, Dino>(
+            "INSERT INTO dinos (id, name, weight, diet) VALUES
+                 ($1, $2, $3, $4) returning id, name, weight, diet",
+        )
+        .bind(dino.id)
+        .bind(dino.name)
+        .bind(dino.weight)
+        .bind(dino.diet)
+        .fetch_one(&db_pool)
+        .await?;
+
         let mut res = Response::new(201);
-        res.set_body(Body::from_json(&dino)?);
+        res.set_body(Body::from_json(&row)?);
 
         Ok(res)
     }
 
     async fn list(req: Request<State>) -> tide::Result {
-        let dinos = req.state().dinos.read().await;
-        let dinos_vec: Vec<Dino> = dinos.values().cloned().collect();
+        let db_pool = req.state().db_pool.clone();
+        let rows = sqlx::query_as::<_, Dino>("SELECT id, name, weight, diet from dinos")
+            .fetch_all(&db_pool)
+            .await?;
+
         let mut res = Response::new(200);
-        res.set_body(Body::from_json(&dinos_vec)?);
+        res.set_body(Body::from_json(&rows)?);
         Ok(res)
     }
 
     async fn get(req: Request<State>) -> tide::Result {
-        let mut dinos = req.state().dinos.write().await;
-        let key = req.param("id")?;
-        let res = match dinos.entry(key.to_string()) {
-            Entry::Vacant(_) => Response::new(404),
-            Entry::Occupied(entry) => {
-                let mut res = Response::new(200);
-                res.set_body(Body::from_json(&entry.get())?);
-                res
-            },
+        let db_pool = req.state().db_pool.clone();
+        let id: Uuid = Uuid::parse_str(req.param("id")?).unwrap();
+        let row =
+            sqlx::query_as::<_, Dino>("SELECT id, name, weight, diet from dinos WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&db_pool)
+                .await?;
+
+        let res = match row {
+            None => Response::new(404),
+            Some(row) => {
+                let mut r = Response::new(200);
+                r.set_body(Body::from_json(&row)?);
+                r
+            }
         };
 
         Ok(res)
     }
 
     async fn update(mut req: Request<State>) -> tide::Result {
-        let dino_update: Dino = req.body_json().await?;
-        let mut dinos = req.state().dinos.write().await;
-        let key = req.param("id")?;
-        let res = match dinos.entry(key.to_string()) {
-            Entry::Vacant(_) => Response::new(404),
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() = dino_update;
-                let mut res = Response::new(200);
-                res.set_body(Body::from_json(&entry.get())?);
-                res
-            },
+        let dino: Dino = req.body_json().await?;
+        let db_pool = req.state().db_pool.clone();
+        let id: Uuid = Uuid::parse_str(req.param("id")?).unwrap();
+        let row = sqlx::query_as::<_, Dino>(
+            "UPDATE dinos SET name = $2, weight = $3, diet = $4
+                WHERE id = $1
+                returning id, name, weight, diet
+                ",
+        )
+        .bind(id)
+        .bind(dino.name)
+        .bind(dino.weight)
+        .bind(dino.diet)
+        .fetch_optional(&db_pool)
+        .await?;
+
+        let res = match row {
+            None => Response::new(404),
+            Some(row) => {
+                let mut r = Response::new(200);
+                r.set_body(Body::from_json(&row)?);
+                r
+            }
         };
 
         Ok(res)
     }
 
     async fn delete(req: Request<State>) -> tide::Result {
-        let mut dinos = req.state().dinos.write().await;
-        let key = req.param("id")?;
-        let deleted = dinos.remove(&key.to_string());
-        let res = match deleted {
+        let db_pool = req.state().db_pool.clone();
+        let id: Uuid = Uuid::parse_str(req.param("id")?).unwrap();
+        let row = sqlx::query(
+            "DELETE FROM dinos
+                WHERE id = $1
+                returning id",
+        )
+        .bind(id)
+        .fetch_optional(&db_pool)
+        .await?;
+
+        let res = match row {
             None => Response::new(404),
             Some(_) => Response::new(204),
         };
+
         Ok(res)
     }
 }
 
+#[async_std::main]
+async fn main() {
+    dotenv::dotenv().ok();
+
+    tide::log::start();
+    let db_pool = make_db_pool().await;
+    let app = server(db_pool).await;
+
+    app.listen("127.0.0.1:8080").await.unwrap();
+}
 
 fn register_rest_entity(app: &mut Server<State>, entity: RestEntity) {
     app.at(&entity.base_path)
@@ -97,10 +152,13 @@ fn register_rest_entity(app: &mut Server<State>, entity: RestEntity) {
         .delete(RestEntity::delete);
 }
 
-async fn server(dinos_store: Arc<RwLock<HashMap<String, Dino>>>) -> Server<State> {
-    let state = State {
-        dinos: dinos_store,
-    };
+pub async fn make_db_pool() -> PgPool {
+    let db_url = std::env::var("DATABASE_URL").unwrap();
+    Pool::connect(&db_url).await.unwrap()
+}
+
+async fn server(db_pool: PgPool) -> Server<State> {
+    let state = State { db_pool };
 
     let dinos_endpoint = RestEntity {
         base_path: String::from("/dinos"),
@@ -114,123 +172,163 @@ async fn server(dinos_store: Arc<RwLock<HashMap<String, Dino>>>) -> Server<State
     app
 }
 
-#[async_std::main]
-async fn main()  {
-    tide::log::start();
-    let dinos_store = Default::default();
-    let app = server(dinos_store).await;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    app.listen("127.0.0.1:8080").await.unwrap();
-}
+    #[async_std::test]
+    async fn index_page() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request as httpRequest, Response, Url};
 
-#[async_std::test]
-async fn index_page() -> tide::Result<()> {
-    use tide::http::{Method, Request as httpRequest, Response, Url};
+        let db_pool = make_db_pool().await;
+        let app = server(db_pool).await;
+        let url = Url::parse("http://127.0.0.1:8080/").unwrap();
+        let req = httpRequest::new(Method::Get, url);
+        let mut res: Response = app.respond(req).await?;
 
-    let dinos_store = Default::default();
-    let app = server(dinos_store).await;
-    let url = Url::parse("http://127.0.0.1:8080").unwrap();
-    let req = httpRequest::new(Method::Get, url);
-    let mut res: Response = app.respond(req).await?;
+        assert_eq!("Ok", res.body_string().await?);
+        Ok(())
+    }
 
-    assert_eq!("Ok", res.body_string().await?);
-    Ok(())
-}
+    #[async_std::test]
+    async fn create_dino() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request, Response, Url};
 
-#[async_std::test]
-async fn list_dinos() -> tide::Result<()> {
-    use tide::http::{Method, Request, Response, Url};
+        let dino = Dino {
+            id: Some(Uuid::new_v4()),
+            name: String::from("test"),
+            weight: 50,
+            diet: String::from("carnivorous"),
+        };
 
-    let dino = Dino {
-        name: String::from("test"),
-        weight: 50,
-        diet: String::from("carnivorous"),
-    };
+        let db_pool = make_db_pool().await;
+        let app = server(db_pool).await;
 
-    let mut dinos_store = HashMap::new();
-    dinos_store.insert(dino.name.clone(), dino);
-    let dinos: Vec<Dino> = dinos_store.values().cloned().collect();
-    let dinos_as_json_string = serde_json::to_string(&dinos)?;
+        let url = Url::parse("http://127.0.0.1/dinos").unwrap();
+        let mut req = Request::new(Method::Post, url);
+        req.set_body(serde_json::to_string(&dino)?);
+        let res: Response = app.respond(req).await?;
+        assert_eq!(201, res.status());
+        Ok(())
+    }
 
-    let state = Arc::new(RwLock::new(dinos_store));
-    let app = server(state).await;
+    #[async_std::test]
+    async fn list_dinos() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request, Response, Url};
 
-    let url = Url::parse("http://127.0.0.1:8080/dinos").unwrap();
-    let req = Request::new(Method::Get, url);
-    let mut res: Response = app.respond(req).await?;
-    let v = res.body_string().await?;
-    assert_eq!(dinos_as_json_string, v);
-    Ok(())
-}
+        let db_pool = make_db_pool().await;
+        let app = server(db_pool).await;
 
-#[async_std::test]
-async fn create_dino() -> tide::Result<()> {
-    use tide::http::{Method, Request, Response, Url};
+        let url = Url::parse("http://127.0.0.1:8080/dinos").unwrap();
+        let req = Request::new(Method::Get, url);
+        let res: Response = app.respond(req).await?;
 
-    let dino = Dino {
-        name: String::from("test"),
-        weight: 50,
-        diet: String::from("carnivorous"),
-    };
+        assert_eq!(200, res.status());
+        Ok(())
+    }
 
-    let dinos_store = HashMap::new();
+    #[async_std::test]
+    async fn get_dino() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request, Response, Url};
 
-    let state = Arc::new(RwLock::new(dinos_store));
-    let app = server(state).await;
-    
-    let url = Url::parse("http://127.0.0.1:8080/dinos").unwrap();
-    let mut req = Request::new(Method::Post, url);
-    req.set_body(serde_json::to_string(&dino)?);
-    let res: Response = app.respond(req).await?;
-    assert_eq!(201, res.status());
-    Ok(())
-}
+        let dino = Dino {
+            id: Some(Uuid::new_v4()),
+            name: String::from("test_get"),
+            weight: 50,
+            diet: String::from("carnivorous"),
+        };
 
-#[async_std::test]
-async fn delete_dino() -> tide::Result<()> {
-    use tide::http::{Method, Request, Response, Url};
+        let db_pool = make_db_pool().await;
+        sqlx::query_as::<_, Dino>(
+            "INSERT INTO dinos (id, name, weight, diet) VALUES
+            ($1, $2, $3, $4) returning id, name, weight, diet",
+        )
+        .bind(dino.id)
+        .bind(dino.name)
+        .bind(dino.weight)
+        .bind(dino.diet)
+        .fetch_one(&db_pool)
+        .await?;
 
-    let dino = Dino {
-        name: String::from("test"),
-        weight: 50,
-        diet: String::from("carnivorous"),
-    };
+        let app = server(db_pool).await;
+        let url =
+            Url::parse(format!("http://127.0.0.1/dinos/{}", &dino.id.unwrap()).as_str()).unwrap();
+        let req = Request::new(Method::Get, url);
+        let res: Response = app.respond(req).await?;
+        assert_eq!(200, res.status());
+        Ok(())
+    }
 
-    let mut dinos_store = HashMap::new();
-    dinos_store.insert(dino.name.clone(), dino);
-    let state = Arc::new(RwLock::new(dinos_store));
-    let app = server(state).await;
-    
-    let url = Url::parse("http://127.0.0.1:8080/dinos/test").unwrap();
-    let req = Request::new(Method::Delete, url);
-    let res: Response = app.respond(req).await?;
+    #[async_std::test]
+    async fn delete_dino() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request, Response, Url};
 
-    assert_eq!(204, res.status());
-    Ok(())
-}
+        let dino = Dino {
+            id: Some(Uuid::new_v4()),
+            name: String::from("test"),
+            weight: 50,
+            diet: String::from("carnivorous"),
+        };
 
-#[async_std::test]
-async fn update_dino() -> tide::Result<()> {
-    use tide::http::{Method, Request, Response, Url};
+        let db_pool = make_db_pool().await;
+        sqlx::query_as::<_, Dino>(
+            "INSERT INTO dinos (id, name, weight, diet) VALUES
+            ($1, $2, $3, $4) returning id, name, weight, diet",
+        )
+        .bind(dino.id)
+        .bind(dino.name)
+        .bind(dino.weight)
+        .bind(dino.diet)
+        .fetch_one(&db_pool)
+        .await?;
 
-    let mut dino = Dino {
-        name: String::from("test"),
-        weight: 50,
-        diet: String::from("carnivorous"),
-    };
+        let app = server(db_pool).await;
+        let url = Url::parse(format!("http://127.0.0.1:8080/dinos/{}", &dino.id.unwrap()).as_str())
+            .unwrap();
+        let req = Request::new(Method::Delete, url);
+        let res: Response = app.respond(req).await?;
 
-    let mut dinos_store = HashMap::new();
-    dinos_store.insert(dino.name.clone(), dino.clone());
-    let state = Arc::new(RwLock::new(dinos_store));
-    let app = server(state).await;
-    let url = Url::parse("http://127.0.0.1:8080/dinos/test").unwrap();
-    let mut req = Request::new(Method::Put, url);
-    dino.weight = 100;
-    req.set_body(serde_json::to_string(&dino)?);
-    let res: Response = app.respond(req).await?;
+        assert_eq!(204, res.status());
+        Ok(())
+    }
 
-    assert_eq!(200, res.status());
-    assert_eq!(dino.weight, 100);
+    #[async_std::test]
+    async fn update_dino() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        use tide::http::{Method, Request, Response, Url};
 
-    Ok(())
+        let mut dino = Dino {
+            id: Some(Uuid::new_v4()),
+            name: String::from("update_test"),
+            weight: 50,
+            diet: String::from("carnivorous"),
+        };
+        let db_pool = make_db_pool().await;
+        sqlx::query_as::<_, Dino>(
+            "INSERT INTO dinos (id, name, weight, diet) VALUES
+            ($1, $2, $3, $4) returning id, name, weight, diet",
+        )
+        .bind(&dino.id)
+        .bind(&dino.name)
+        .bind(&dino.weight)
+        .bind(&dino.diet)
+        .fetch_one(&db_pool)
+        .await?;
+        let app = server(db_pool).await;
+        let url = Url::parse(format!("http://127.0.0.1:8080/dinos/{}", &dino.id.unwrap()).as_str()).unwrap();
+        let mut req = Request::new(Method::Put, url);
+        dino.weight = 100;
+        req.set_body(serde_json::to_string(&dino)?);
+        let res: Response = app.respond(req).await?;
+
+        assert_eq!(200, res.status());
+        assert_eq!(dino.weight, 100);
+
+        Ok(())
+    }
 }
