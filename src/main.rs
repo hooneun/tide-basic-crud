@@ -1,12 +1,19 @@
 use dotenv;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPool, Pool};
+use tera::Tera;
 use tide::{Body, Request, Response, Server};
 use uuid::Uuid;
+
+mod controller;
+mod handlers;
+
+use controller::{dino, views};
 
 #[derive(Clone, Debug)]
 struct State {
     db_pool: PgPool,
+    tera: Tera,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, sqlx::FromRow)]
@@ -154,14 +161,28 @@ pub async fn make_db_pool(db_url: &str) -> PgPool {
 }
 
 async fn server(db_pool: PgPool) -> Server<State> {
-    let state = State { db_pool };
+    let mut tera = Tera::new("templates/**/*").expect("Error parsing templates directory");
+    tera.autoescape_on(vec!["html"]);
+
+    let state = State { db_pool, tera };
 
     let dinos_endpoint = RestEntity {
         base_path: String::from("/dinos"),
     };
 
     let mut app = tide::with_state(state);
-    app.at("/").get(|_| async { Ok("Ok") });
+    app.at("/public")
+        .serve_dir("./public/")
+        .expect("Invalid static file directory");
+
+    app.at("/").get(views::index);
+    app.at("/dinos/new").get(views::new);
+    app.at("/dinos").get(dino::list).post(dino::create);
+
+    app.at("/dinos/:id/edit")
+        .get(dino::get)
+        .put(dino::update)
+        .delete(dino::delete);
 
     register_rest_entity(&mut app, dinos_endpoint);
 
@@ -182,6 +203,24 @@ mod tests {
         let db_pool = make_db_pool(&DB_URL).await;
 
         sqlx::query("DELETE FROM dinos").execute(&db_pool).await?;
+        Ok(())
+    }
+
+    #[async_std::test]
+    async fn list_dinos() -> tide::Result<()> {
+        dotenv::dotenv().ok();
+        clear_dinos()
+            .await
+            .expect("Failed to clear the dinos table");
+
+        let db_pool = make_db_pool(&DB_URL).await;
+        let app = server(db_pool).await;
+
+        let res = surf::Client::with_http_client(app)
+            .get("http://127.0.0.1:8080/dinos")
+            .await?;
+
+        assert_eq!(200, res.status());
         Ok(())
     }
 
@@ -214,23 +253,20 @@ mod tests {
         Ok(())
     }
 
-    #[async_std::test]
-    async fn list_dinos() -> tide::Result<()> {
-        dotenv::dotenv().ok();
-        clear_dinos()
-            .await
-            .expect("Failed to clear the dinos table");
-
-        let db_pool = make_db_pool(&DB_URL).await;
-        let app = server(db_pool).await;
-
-        let res = surf::Client::with_http_client(app)
-            .get("http://127.0.0.1:8080/dinos")
-            .await?;
-
-        assert_eq!(200, res.status());
-        Ok(())
-    }
+    //    #[async_std::test]
+    //    async fn create_dino_with_existing_key() -> tide::Result<()> {
+    //        dotenv::dotenv().ok();
+    //        clear_dinos()
+    //            .await
+    //            .expect("Failed to clear the dinos table");
+    //
+    //        let dino = Dino {
+    //            id: Some(Uuid::new_v4()),
+    //            name: String::from("test_get"),
+    //            weight: 500,
+    //            diet: String::from("carnivorous"),
+    //        };
+    //    }
 
     #[async_std::test]
     async fn get_dino() -> tide::Result<()> {

@@ -16,7 +16,9 @@ log = "0.4.14"
 serde = { version = "1.0.127", features = ["derive"] }
 serde_json = "1.0.66"
 sqlx = { version = "0.5.5", features = ["runtime-async-std-native-tls", "macros", "chrono", "json", "postgres", "uuid"]}
+tera = "1.12.1"
 tide = "0.16.0"
+tide-tera = "0.2.4"
 uuid = { version = "0.8.2", features = ["v4", "serde"] }
 
 [dev-dependencies]
